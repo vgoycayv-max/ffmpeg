@@ -26,18 +26,23 @@ final Directory klasor = Directory('/sdcard/ffmpeg');
 const sesUzantilar = ['.mp3', '.m4a', '.wav', '.aac', '.ogg', '.opus', '.flac'];
 const resimUzantilar = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'];
 const kopyalanabilir = ['.mp3', '.m4a', '.aac'];
-const crf = '30';
 const preset = 'ultrafast';
-const fps = '1';
-const cozunurluk = '1280:720';
 // ---------------------------------------------------------------
 
 enum Mode { muzikKaldir, sesiKapat }
 
+// Çıktı ayarları
+class Opts {
+  int fps = 1; // saniyedeki kare sayısı (sabit resim için 1 yeterli)
+  int crf = 30; // video kalitesi: küçük sayı = daha iyi ve daha büyük
+  String res = '1280:720'; // video boyutu
+  int audioKbps = 0; // 0 = otomatik (kaynak sese yakın)
+}
+
 class Pair {
   final String name;
   final File audio;
-  final File image;
+  final File? image; // resim yoksa sadece ses kaydedilebilir
   Pair(this.name, this.audio, this.image);
 
   String get ext {
@@ -46,6 +51,7 @@ class Pair {
   }
 
   File get output => File('${klasor.path}/$name.mp4');
+  File audioOut(String ext) => File('${klasor.path}/${name}_ses$ext');
 }
 
 // Müziği kaldırma / susturma aralığı
@@ -91,11 +97,12 @@ class Engine {
       if (dot <= 0) continue; // gizli dosyalar ve uzantısızlar
       final name = base.substring(0, dot);
       final ext = base.substring(dot).toLowerCase();
+      if (name.endsWith('_ses')) continue; // kendi çıktılarımız
       if (sesUzantilar.contains(ext)) audios[name] = e;
       if (resimUzantilar.contains(ext)) images[name] = e;
     }
-    final ortak = audios.keys.where(images.containsKey).toList()..sort();
-    return [for (final n in ortak) Pair(n, audios[n]!, images[n]!)];
+    final adlar = audios.keys.toList()..sort();
+    return [for (final n in adlar) Pair(n, audios[n]!, images[n])];
   }
 
   static Future<double> sure(String path) async {
@@ -123,59 +130,98 @@ class Engine {
 
   static String _n(double x) => x.toStringAsFixed(3);
 
+  static Future<int> kaynakKbps(String path) async {
+    try {
+      final s = await FFprobeKit.getMediaInformation(path);
+      final b = int.tryParse(s.getMediaInformation()?.getBitrate() ?? '') ?? 0;
+      return b ~/ 1000;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   /// Başarılıysa null, hata varsa hata metni döner.
+  ///  opts      : kare sayısı, kalite, boyut, ses kalitesi
+  ///  sadeceSes : true ise video yapmaz, sadece ses dosyası (m4a) kaydeder
   ///  anaSure   : ana ses dosyasının tam süresi (bilinmiyorsa 0)
   ///  mainStart / mainEnd : ana sesten tutulacak parça (mainEnd 0 ise sona kadar)
   ///  layers    : üste bindirilecek sesler
-  ///  toplam    : çıkacak videonun süresi (sadece ilerleme çubuğu için)
+  ///  toplam    : çıkacak dosyanın süresi (sadece ilerleme çubuğu için)
   static Future<String?> uret(
     Pair p,
     List<Seg> segs,
     Mode mode,
     double toplam,
     void Function(double) ilerleme, {
+    Opts? opts,
+    bool sadeceSes = false,
     double anaSure = 0,
     double mainStart = 0,
     double mainEnd = 0,
     List<Layer> layers = const [],
   }) async {
-    final args = <String>[
-      '-y',
-      '-loop', '1',
-      '-framerate', fps,
-      '-i', p.image.path, // girdi 0: resim
-      '-i', p.audio.path, // girdi 1: ana ses
-      for (final l in layers) ...['-i', l.path], // girdi 2, 3, ...: eklenen sesler
-      '-vf',
-      'scale=$cozunurluk:force_original_aspect_ratio=decrease,'
-          'pad=$cozunurluk:(ow-iw)/2:(oh-ih)/2',
-      '-c:v', 'libx264',
-      '-tune', 'stillimage',
-      '-preset', preset,
-      '-crf', crf,
-      '-pix_fmt', 'yuv420p',
-      '-r', fps,
-      '-g', '10',
-    ];
+    final o = opts ?? Opts();
+    final ses = sadeceSes || p.image == null;
+    final a0 = ses ? 0 : 1; // ana sesin girdi numarası
 
     final gecerli = segs.where((s) => s.end > s.start).toList();
     final kesik = anaSure > 0 &&
         (mainStart > 0.05 || (mainEnd > 0 && mainEnd < anaSure - 0.05));
+    final duzenleme = kesik || gecerli.isNotEmpty || layers.isNotEmpty;
+    // Sadece kesme (ya da hiç düzenleme yok) ve video: ses yeniden kodlanmaz.
+    // Böylece hızlı olur ve ses dosyası büyümez.
+    final kopya = !ses &&
+        kopyalanabilir.contains(p.ext) &&
+        gecerli.isEmpty &&
+        layers.isEmpty;
 
-    if (!kesik && gecerli.isEmpty && layers.isEmpty) {
-      // Hiçbir düzenleme yok: ses yeniden kodlanmaz (kalite aynı kalır)
-      if (kopyalanabilir.contains(p.ext)) {
-        args.addAll(['-c:a', 'copy']);
-      } else {
-        args.addAll(['-c:a', 'aac', '-b:a', '192k']);
-      }
+    var kbps = o.audioKbps;
+    if (kbps <= 0) {
+      final k = await kaynakKbps(p.audio.path);
+      kbps = k > 0 ? k.clamp(48, 192).toInt() : 96;
+    }
+
+    final args = <String>['-y'];
+    if (!ses) {
+      args.addAll(['-loop', '1', '-framerate', '${o.fps}', '-i', p.image!.path]);
+    }
+    if (kopya && kesik) {
+      args.addAll(['-ss', _n(mainStart)]);
+      if (mainEnd > mainStart) args.addAll(['-t', _n(mainEnd - mainStart)]);
+    }
+    args.addAll(['-i', p.audio.path]);
+    for (final l in layers) {
+      args.addAll(['-i', l.path]);
+    }
+
+    if (!ses) {
+      args.addAll([
+        '-vf',
+        'scale=${o.res}:force_original_aspect_ratio=decrease,'
+            'pad=${o.res}:(ow-iw)/2:(oh-ih)/2',
+        '-c:v', 'libx264',
+        '-tune', 'stillimage',
+        '-preset', preset,
+        '-crf', '${o.crf}',
+        '-pix_fmt', 'yuv420p',
+        '-r', '${o.fps}',
+        '-g', '${o.fps * 10}',
+      ]);
+    } else {
+      args.add('-vn');
+    }
+
+    if (kopya) {
+      args.addAll(['-c:a', 'copy']);
+    } else if (!duzenleme) {
+      args.addAll(['-c:a', 'aac', '-b:a', '${kbps}k']);
     } else {
       final f = <String>[];
-      const fmt = 'aformat=sample_rates=48000:channel_layouts=stereo';
+      const fmt = 'aformat=sample_rates=44100';
 
       // 1) Ana sesi kes
       final bitis = mainEnd > mainStart ? ':end=${_n(mainEnd)}' : '';
-      f.add('[1:a]atrim=start=${_n(mainStart)}$bitis,'
+      f.add('[$a0:a]atrim=start=${_n(mainStart)}$bitis,'
           'asetpts=PTS-STARTPTS,$fmt[m0]');
 
       // 2) Müzik kaldır / sustur (süreler, kesilmiş sese göre)
@@ -193,8 +239,6 @@ class Engine {
             'lowpass=f=5000',
             if (model != null) 'arnndn=m=$model',
           ].join(',');
-          // Ses ikiye ayrılır: orijinal (aralık DIŞINDA duyulur) ve
-          // temizlenmiş (aralık İÇİNDE duyulur). Sonra ikisi birleştirilir.
           f.add('[m0]asplit=2[o][p]');
           f.add('[p]$zincir[pf]');
           f.add("[o]volume=0:enable='$expr'[oo]");
@@ -203,12 +247,12 @@ class Engine {
         }
       }
 
-      // 3) Eklenen sesler: kes, ses seviyesi, videoda başlama zamanına ertele
+      // 3) Eklenen sesler
       final etiket = <String>['[m]'];
       for (var i = 0; i < layers.length; i++) {
         final l = layers[i];
         final ms = l.placeAt * 1000;
-        f.add('[${i + 2}:a]atrim=start=${_n(l.trimStart)}:end=${_n(l.trimEnd)},'
+        f.add('[${a0 + 1 + i}:a]atrim=start=${_n(l.trimStart)}:end=${_n(l.trimEnd)},'
             'asetpts=PTS-STARTPTS,$fmt,'
             'volume=${l.volume.toStringAsFixed(2)},'
             'adelay=$ms:all=1[l$i]');
@@ -223,15 +267,14 @@ class Engine {
             'duration=longest,alimiter=limit=0.95[a]');
       }
 
-      args.addAll([
-        '-filter_complex', f.join(';'),
-        '-map', '0:v',
-        '-map', '[a]',
-        '-c:a', 'aac', '-b:a', '192k',
-      ]);
+      args.addAll(['-filter_complex', f.join(';')]);
+      if (!ses) args.addAll(['-map', '0:v']);
+      args.addAll(['-map', '[a]', '-c:a', 'aac', '-b:a', '${kbps}k']);
     }
 
-    args.addAll(['-shortest', '-movflags', '+faststart', p.output.path]);
+    if (!ses) args.add('-shortest');
+    args.addAll(['-movflags', '+faststart']);
+    args.add(ses ? p.audioOut('.m4a').path : p.output.path);
 
     final c = Completer<String?>();
     await FFmpegKit.executeWithArgumentsAsync(
@@ -326,7 +369,7 @@ class _HomePageState extends State<HomePage> {
     int ok = 0, atlanan = 0, hata = 0;
     for (var i = 0; i < pairs.length; i++) {
       final p = pairs[i];
-      if (p.output.existsSync()) {
+      if (p.image == null || p.output.existsSync()) {
         atlanan++;
         continue;
       }
@@ -377,8 +420,9 @@ class _HomePageState extends State<HomePage> {
               Padding(
                 padding: const EdgeInsets.all(12),
                 child: Text(
-                  'Klasör: ${klasor.path}\nEşleşen ses + resim çifti: ${pairs.length}\n'
-                  'Aynı isimli dosyalar eşleşir (örn. tiyatro.mp3 + tiyatro.jpg).',
+                  'Klasör: ${klasor.path}\nSes dosyası: ${pairs.length}\n'
+                  'Aynı isimli resim eşleşir (örn. tiyatro.mp3 + tiyatro.jpg). '
+                  'Resmi olmayan sesler sadece ses olarak kaydedilir.',
                 ),
               ),
               if (calisiyor) LinearProgressIndicator(value: ilerleme),
@@ -390,11 +434,15 @@ class _HomePageState extends State<HomePage> {
                   itemBuilder: (_, i) {
                     final p = pairs[i];
                     return ListTile(
-                      leading: Image.file(p.image, width: 56, height: 56, fit: BoxFit.cover,
+                      leading: p.image == null
+                          ? const SizedBox(width: 56, height: 56, child: Icon(Icons.audiotrack))
+                          : Image.file(p.image!, width: 56, height: 56, fit: BoxFit.cover,
                           cacheWidth: 112,
                           errorBuilder: (_, __, ___) => const Icon(Icons.image)),
                       title: Text(p.name),
-                      subtitle: Text(p.output.existsSync() ? 'mp4 hazır ✅' : p.audio.path.split('/').last),
+                      subtitle: Text(p.image == null
+                          ? 'resim yok (sadece ses)'
+                          : p.output.existsSync() ? 'mp4 hazır ✅' : p.audio.path.split('/').last),
                       trailing: const Icon(Icons.chevron_right),
                       onTap: calisiyor
                           ? null
@@ -437,6 +485,9 @@ class _EditorPageState extends State<EditorPage> {
   final List<Seg> segs = [];
   final List<Layer> layers = [];
   Mode mode = Mode.muzikKaldir;
+  final Opts opts = Opts();
+  bool sadeceSes = false;
+  bool get sesMod => sadeceSes || widget.pair.image == null;
   double toplam = 0; // ana sesin tam süresi
   double mainStart = 0; // ana sesten tutulacak parça
   double mainEnd = 0;
@@ -497,6 +548,8 @@ class _EditorPageState extends State<EditorPage> {
       mode,
       video,
       (x) => setState(() => ilerleme = x),
+      opts: opts,
+      sadeceSes: sesMod,
       anaSure: toplam,
       mainStart: mainStart,
       mainEnd: mainEnd,
@@ -505,10 +558,14 @@ class _EditorPageState extends State<EditorPage> {
     await WakelockPlus.disable();
     setState(() {
       calisiyor = false;
-      durum = err ?? '✅ Bitti: ${widget.pair.output.path}';
+      durum = err ??
+          '✅ Bitti: ${sesMod ? widget.pair.audioOut('.m4a').path : widget.pair.output.path}';
       if (err == null) ilerleme = 1;
     });
   }
+
+  Widget ayar(String ad, Widget w) =>
+      Row(children: [Expanded(child: Text(ad)), w]);
 
   @override
   Widget build(BuildContext context) {
@@ -518,7 +575,11 @@ class _EditorPageState extends State<EditorPage> {
       body: ListView(padding: const EdgeInsets.all(12), children: [
         ClipRRect(
           borderRadius: BorderRadius.circular(8),
-          child: Image.file(p.image, height: 160, fit: BoxFit.cover, cacheWidth: 600),
+          child: p.image == null
+              ? const SizedBox(
+                  height: 80,
+                  child: Center(child: Text('Resim yok: sadece ses kaydedilebilir')))
+              : Image.file(p.image!, height: 160, fit: BoxFit.cover, cacheWidth: 600),
         ),
         const SizedBox(height: 8),
         Text('Ses süresi: ${toplam > 0 ? sureYaz(toplam) : '...'}'),
@@ -651,6 +712,77 @@ class _EditorPageState extends State<EditorPage> {
           icon: const Icon(Icons.add),
           label: const Text('Aralık ekle'),
         ),
+        // ---------- 4) ÇIKTI AYARLARI ----------
+        const Divider(height: 24),
+        const Text('4) Çıktı ayarları', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        SegmentedButton<bool>(
+          segments: [
+            ButtonSegment(
+                value: false,
+                label: const Text('Video'),
+                icon: const Icon(Icons.movie),
+                enabled: p.image != null),
+            const ButtonSegment(
+                value: true, label: Text('Sadece ses'), icon: Icon(Icons.audiotrack)),
+          ],
+          selected: {sesMod},
+          onSelectionChanged: calisiyor ? null : (v) => setState(() => sadeceSes = v.first),
+        ),
+        if (!sesMod) ...[
+          ayar(
+            'Kare sayısı (saniyede)',
+            DropdownButton<int>(
+              value: opts.fps,
+              items: [1, 2, 5, 10, 24, 30]
+                  .map((x) => DropdownMenuItem(value: x, child: Text('$x')))
+                  .toList(),
+              onChanged: calisiyor ? null : (v) => setState(() => opts.fps = v!),
+            ),
+          ),
+          ayar(
+            'Video kalitesi',
+            DropdownButton<int>(
+              value: opts.crf,
+              items: const [
+                DropdownMenuItem(value: 35, child: Text('Düşük (küçük dosya)')),
+                DropdownMenuItem(value: 30, child: Text('Orta')),
+                DropdownMenuItem(value: 24, child: Text('Yüksek')),
+                DropdownMenuItem(value: 20, child: Text('Çok yüksek')),
+              ],
+              onChanged: calisiyor ? null : (v) => setState(() => opts.crf = v!),
+            ),
+          ),
+          ayar(
+            'Video boyutu',
+            DropdownButton<String>(
+              value: opts.res,
+              items: const [
+                DropdownMenuItem(value: '854:480', child: Text('480p')),
+                DropdownMenuItem(value: '1280:720', child: Text('720p')),
+                DropdownMenuItem(value: '1920:1080', child: Text('1080p')),
+              ],
+              onChanged: calisiyor ? null : (v) => setState(() => opts.res = v!),
+            ),
+          ),
+          const Text('Sabit resim için 1 kare yeterlidir: en hızlı ve en küçük dosya budur.',
+              style: TextStyle(fontSize: 12)),
+        ],
+        ayar(
+          'Ses kalitesi',
+          DropdownButton<int>(
+            value: opts.audioKbps,
+            items: const [
+              DropdownMenuItem(value: 0, child: Text('Otomatik (kaynağa yakın)')),
+              DropdownMenuItem(value: 48, child: Text('48 kbps')),
+              DropdownMenuItem(value: 64, child: Text('64 kbps')),
+              DropdownMenuItem(value: 96, child: Text('96 kbps')),
+              DropdownMenuItem(value: 128, child: Text('128 kbps')),
+              DropdownMenuItem(value: 192, child: Text('192 kbps')),
+            ],
+            onChanged: calisiyor ? null : (v) => setState(() => opts.audioKbps = v!),
+          ),
+        ),
         const SizedBox(height: 16),
         if (calisiyor || ilerleme > 0) LinearProgressIndicator(value: ilerleme),
         if (durum.isNotEmpty)
@@ -658,8 +790,8 @@ class _EditorPageState extends State<EditorPage> {
         const SizedBox(height: 16),
         FilledButton.icon(
           onPressed: (calisiyor || toplam <= 0) ? null : olustur,
-          icon: const Icon(Icons.movie_creation),
-          label: const Text('Videoyu oluştur'),
+          icon: Icon(sesMod ? Icons.audiotrack : Icons.movie_creation),
+          label: Text(sesMod ? 'Sesi kaydet' : 'Videoyu oluştur'),
         ),
         const SizedBox(height: 24),
       ]),
