@@ -1,0 +1,22 @@
+name: video_birlestirici
+description: Sabit resim + ses -> YouTube uyumlu mp4, aralıklı müzik temizleme, ses bindirme
+publish_to: 'none'
+version: 1.1.0+2
+
+environment:
+  sdk: '>=3.1.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffmpeg_kit_flutter_new: ^4.5.3
+  path_provider: ^2.1.0
+  permission_handler: ^11.3.1
+  wakelock_plus: ^1.2.0
+  audioplayers: ^6.1.0
+  file_picker: ^8.1.2
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
