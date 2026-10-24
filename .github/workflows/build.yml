@@ -55,6 +55,19 @@ jobs:
           open(m, 'w').write(t)
           PY
 
+      - name: Tüm eklentileri Android 36 ile derle (file_picker hatası düzeltmesi)
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/sdk36.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.hasProperty('android')) {
+                p.android.compileSdk = 36
+              }
+            }
+          }
+          EOF
+
       - name: Paketleri indir
         working-directory: app
         run: flutter pub get
